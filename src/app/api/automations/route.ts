@@ -60,6 +60,9 @@ export async function POST(request: Request) {
   if (!body) return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
 
   const { name, description, trigger_type, trigger_config, is_active, steps, template } = body
+  if (template === 'follow_up_reminder') return NextResponse.json({
+    error: 'The legacy follow-up preset is disabled. Use confirmed follow-up tools with configured messaging eligibility and allowances.',
+  }, { status: 409 })
 
   let effectiveSteps: BuilderStepInput[] | undefined = steps
   let effectiveName = name

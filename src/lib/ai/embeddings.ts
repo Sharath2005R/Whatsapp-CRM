@@ -1,16 +1,18 @@
 import { AiError } from './types'
 import { aiRequestTimeoutMs } from './defaults'
 import { providerHttpError, toNetworkError } from './providers/shared'
+import type { EmbeddingConfig } from './embedding-config'
+import { embedOllama } from './providers/ollama-embeddings'
 
 // ============================================================
-// Embeddings (OpenAI-compatible).
+// Embeddings: existing OpenAI interface plus operator-managed local Ollama.
 //
 // Used for the knowledge base's optional semantic-search path: embed
 // each chunk at ingest, and embed the query at retrieval. Anthropic has
-// no embeddings endpoint, so this is always OpenAI's — the account
-// supplies a (possibly separate) embeddings key. 1536-dim
+// no embeddings endpoint, so existing paid-provider accounts use OpenAI and
+// supply a (possibly separate) embeddings key. 1536-dim
 // text-embedding-3-small matches the `vector(1536)` column in
-// migration 030.
+// migration 030. Ollama uses the independent 1024-dim space in migration 042.
 // ============================================================
 
 const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings'
@@ -39,10 +41,15 @@ export function toVectorLiteral(embedding: number[]): string {
  * to degrade (retrieval) or surface (ingest).
  */
 export async function embedTexts(
-  apiKey: string,
+  apiKey: string | EmbeddingConfig,
   inputs: string[],
+  purpose: 'query' | 'document' = 'document',
 ): Promise<number[][]> {
   if (inputs.length === 0) return []
+  if (typeof apiKey !== 'string') {
+    if (apiKey.provider === 'ollama') return embedOllama(apiKey, inputs, purpose)
+    return embedTexts(apiKey.apiKey, inputs, purpose)
+  }
   const timeoutMs = aiRequestTimeoutMs()
   const out: number[][] = []
 

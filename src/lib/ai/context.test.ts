@@ -1,18 +1,21 @@
 import { describe, it, expect } from 'vitest'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { buildConversationContext } from './context'
+import { testContext } from './test-helpers'
 
 /** Minimal fake matching the query chain in buildConversationContext:
  *  from().select().eq().eq().order().limit() → { data, error }. */
-function fakeDb(rows: unknown[]): SupabaseClient {
+function fakeDb(rows: unknown[]) {
+  let table = ''
   const chain = {
-    from: () => chain,
+    from: (name: string) => { table = name; return chain },
     select: () => chain,
     eq: () => chain,
     order: () => chain,
     limit: () => Promise.resolve({ data: rows, error: null }),
+    maybeSingle: () => Promise.resolve({ data: table === 'conversations' ? { id: 'conv-1', contact_id: 'contact-1' } : { id: 'contact-1' }, error: null }),
   }
-  return chain as unknown as SupabaseClient
+  return testContext(chain as unknown as SupabaseClient)
 }
 
 describe('buildConversationContext', () => {

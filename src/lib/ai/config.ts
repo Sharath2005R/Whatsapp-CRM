@@ -1,11 +1,11 @@
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { assertAiContext, type AiExecutionContext } from './execution-context'
 import { decrypt } from '@/lib/whatsapp/encryption'
-import type { AiConfig } from './types'
+import type { AiConfig, AiProvider } from './types'
 
 interface AiConfigRow {
-  provider: 'openai' | 'anthropic'
+  provider: AiProvider
   model: string
-  api_key: string
+  api_key: string | null
   system_prompt: string | null
   is_active: boolean
   auto_reply_enabled: boolean
@@ -25,14 +25,15 @@ const CONFIG_COLUMNS =
  * (mismatched `ENCRYPTION_KEY`), so that distinct failure surfaces
  * rather than looking like "not configured".
  *
- * Works with any client: pass the RLS-scoped SSR client from a
- * dashboard route, or the service-role admin client from the webhook.
+ * Requires a server-issued context, retaining its original RLS-scoped
+ * dashboard client or verified webhook service-role client.
  */
 export async function loadAiConfig(
-  db: SupabaseClient,
-  accountId: string,
+  context: AiExecutionContext,
   opts: { requireActive?: boolean } = {},
 ): Promise<AiConfig | null> {
+  assertAiContext(context)
+  const { db, accountId } = context
   const { requireActive = true } = opts
   const { data, error } = await db
     .from('ai_configs')
@@ -47,16 +48,15 @@ export async function loadAiConfig(
   // The Playground passes requireActive:false so an admin can test the
   // agent before flipping the master switch on.
   if (requireActive && !row.is_active) return null
-  // Defensive: the column is NOT NULL, but a partial write / manual DB
-  // edit could leave it empty. Treat a missing key as "not configured"
-  // rather than letting decrypt() throw on null.
-  if (!row.api_key) return null
+  // Paid providers require a stored key; Ollama uses server configuration.
+  if (row.provider !== 'ollama' && !row.api_key) return null
 
   // The embeddings key is optional and independent of the chat key —
   // a corrupt/undecryptable one should downgrade to lexical KB, not
   // take down draft/auto-reply, so decrypt failures are swallowed here.
+  // Ollama selects its local embedding adapter separately; never decrypt a paid key.
   let embeddingsApiKey: string | null = null
-  if (row.embeddings_api_key) {
+  if (row.provider !== 'ollama' && row.embeddings_api_key) {
     try {
       embeddingsApiKey = decrypt(row.embeddings_api_key)
     } catch {
@@ -72,7 +72,7 @@ export async function loadAiConfig(
   return {
     provider: row.provider,
     model: row.model,
-    apiKey: decrypt(row.api_key),
+    apiKey: row.provider === 'ollama' ? '' : decrypt(row.api_key!),
     systemPrompt: row.system_prompt,
     isActive: row.is_active,
     autoReplyEnabled: row.auto_reply_enabled,
@@ -94,21 +94,25 @@ export async function loadAiConfig(
  * lexical-only and reporting success.
  */
 export async function loadEmbeddingsKey(
-  db: SupabaseClient,
-  accountId: string,
-): Promise<{ key: string | null; corrupt: boolean }> {
+  context: AiExecutionContext,
+): Promise<{ key: string | null; corrupt: boolean; provider: AiProvider }> {
+  assertAiContext(context)
+  const { db, accountId } = context
   const { data, error } = await db
     .from('ai_configs')
-    .select('embeddings_api_key')
+    .select('provider, embeddings_api_key')
     .eq('account_id', accountId)
     .maybeSingle()
-  if (error || !data?.embeddings_api_key) return { key: null, corrupt: false }
+  if (error) throw error
+  const provider: AiProvider = data?.provider ?? 'ollama'
+  if (provider === 'ollama' || !data?.embeddings_api_key)
+    return { key: null, corrupt: false, provider }
   try {
-    return { key: decrypt(data.embeddings_api_key), corrupt: false }
+    return { key: decrypt(data.embeddings_api_key), corrupt: false, provider }
   } catch {
     console.error(
       `[ai config] embeddings key for account ${accountId} could not be decrypted — check ENCRYPTION_KEY.`,
     )
-    return { key: null, corrupt: true }
+    return { key: null, corrupt: true, provider }
   }
 }

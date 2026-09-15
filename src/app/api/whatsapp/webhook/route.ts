@@ -10,6 +10,7 @@ import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
+import { recordFollowupStatus } from '@/lib/followups/worker'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   handleTemplateWebhookChange,
@@ -249,7 +250,7 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
       // Handle status updates
       if (value.statuses) {
         for (const status of value.statuses) {
-          await handleStatusUpdate(status)
+          await handleStatusUpdate(status, value.metadata.phone_number_id)
         }
       }
 
@@ -369,16 +370,23 @@ async function handleStatusUpdate(status: {
   status: string
   timestamp: string
   recipient_id: string
-}) {
+  biz_opaque_callback_data?: string
+}, phoneNumberId: string) {
+  const followupStorageReady = process.env.AI_FOLLOWUP_STORAGE_READY === '1' || process.env.AI_FOLLOWUPS_ENABLED === '1'
+  if (followupStorageReady &&
+      await recordFollowupStatus(supabaseAdmin(), phoneNumberId, status)) return
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
   //    already match the CHECK constraint on messages.status. No
   //    `.select()`: message_id is NOT unique (migration 009 — Meta ids
   //    repeat across numbers), so this updates 0..N rows and must not
   //    assume a single row.
-  const { error: msgErr } = await supabaseAdmin()
+  const messageUpdate = supabaseAdmin()
     .from('messages')
     .update({ status: status.status })
     .eq('message_id', status.id)
+  // Never let the legacy unscoped mirror bypass follow-up sender binding.
+  const { error: msgErr } = await (followupStorageReady
+    ? messageUpdate.is('followup_id', null) : messageUpdate)
 
   if (msgErr) {
     console.error('Error updating message status:', msgErr)

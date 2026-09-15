@@ -21,6 +21,18 @@ The marketing site and self-host docs live in a separate repo:
 ([wacrm.tech](https://wacrm.tech)). This repo is the product —
 clone or fork it to run your own CRM.
 
+## Fork additions and documentation
+
+This working tree extends the template with tenant-scoped local AI, retrieval,
+controlled backend actions, and guarded follow-up scheduling. The local AI
+path uses Ollama; the original OpenAI and Anthropic adapters remain for
+existing configurations but are not a fallback for the local provider.
+
+Implementation and verification boundaries are documented in
+[docs/STATUS.md](./docs/STATUS.md). Architecture, data relationships, system
+flows, AI behavior, controlled tools, follow-ups, and endpoint navigation are
+available through [docs/README.md](./docs/README.md).
+
 ## What you get out of the box
 
 - **Shared inbox** on the official WhatsApp Business API — multiple
@@ -92,6 +104,22 @@ Open <http://localhost:3000>. You'll be redirected to `/login` (or
 
 Prefer containers? See [docs/docker.md](./docs/docker.md) for the
 Dockerfile + Docker Compose setup.
+
+### Local Ollama setup
+
+Install Ollama on the operator-controlled server, keep its API private, and
+pull the intended local models:
+
+~~~bash
+ollama serve
+ollama pull qwen3:4b
+ollama pull qwen3-embedding:0.6b
+~~~
+
+Set the server-only Ollama environment values in .env.local. The supplied
+examples use the loopback API and disable cloud features. See
+[docs/ollama.md](./docs/ollama.md) and [docs/AI.md](./docs/AI.md) before
+enabling the AI path.
 
 ## 🚀 Deploy on Hostinger (recommended)
 

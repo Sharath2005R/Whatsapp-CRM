@@ -1,11 +1,16 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
-import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
+import {
+  checkRateLimit,
+  rateLimitResponse,
+  RATE_LIMITS,
+} from '@/lib/rate-limit'
 import { loadAiConfig } from '@/lib/ai/config'
 import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
-import { buildSystemPrompt } from '@/lib/ai/defaults'
-import { latestUserMessage } from '@/lib/ai/query'
+import { buildSystemPrompt, withKnowledgeReferences } from '@/lib/ai/defaults'
+import { authenticatedAiContext } from '@/lib/ai/execution-context'
+import { knowledgeQuery } from '@/lib/ai/query'
 import { AiError, type ChatMessage } from '@/lib/ai/types'
 
 // Keep the tested transcript bounded, mirroring the live context window.
@@ -23,7 +28,9 @@ const MAX_TURNS = 20
  */
 export async function POST(request: Request) {
   try {
-    const { supabase, accountId, userId } = await requireRole('agent')
+    const account = await requireRole('agent')
+    const { userId } = account
+    const context = authenticatedAiContext(account)
 
     const limit = checkRateLimit(`ai-playground:${userId}`, RATE_LIMITS.aiDraft)
     if (!limit.success) return rateLimitResponse(limit)
@@ -31,7 +38,10 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => null)
     const rawMessages = Array.isArray(body?.messages) ? body.messages : null
     if (!rawMessages) {
-      return NextResponse.json({ error: 'messages is required' }, { status: 400 })
+      return NextResponse.json(
+        { error: 'messages is required' },
+        { status: 400 },
+      )
     }
 
     const messages: ChatMessage[] = rawMessages
@@ -45,6 +55,7 @@ export async function POST(request: Request) {
           (m as ChatMessage).content.trim().length > 0,
       )
       .slice(-MAX_TURNS)
+      .map(({ role, content }: ChatMessage) => ({ role, content }))
 
     if (messages.length === 0) {
       return NextResponse.json(
@@ -53,7 +64,7 @@ export async function POST(request: Request) {
       )
     }
 
-    const config = await loadAiConfig(supabase, accountId, {
+    const config = await loadAiConfig(context, {
       requireActive: false,
     }).catch((err) => {
       console.error('[ai/playground] loadAiConfig error:', err)
@@ -65,7 +76,8 @@ export async function POST(request: Request) {
     if (!config) {
       return NextResponse.json(
         {
-          error: 'No agent configured yet. Add your provider key in Setup.',
+          error:
+            'No agent configured yet. Choose a provider and model in Setup.',
           code: 'ai_not_configured',
         },
         { status: 400 },
@@ -73,18 +85,24 @@ export async function POST(request: Request) {
     }
 
     const knowledge = await retrieveKnowledge(
-      supabase,
-      accountId,
+      context,
       config,
-      latestUserMessage(messages),
+      knowledgeQuery(messages),
     )
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
-      knowledge,
+      businessName: context.businessName,
+      hasKnowledge: knowledge.length > 0,
     })
 
-    const { text, handoff } = await generateReply({ config, systemPrompt, messages })
+    const { text, handoff } = await generateReply({
+      knowledge,
+      context,
+      config,
+      systemPrompt,
+      messages: withKnowledgeReferences(messages, knowledge),
+    })
     return NextResponse.json({ reply: text, handoff })
   } catch (err) {
     if (err instanceof AiError) {

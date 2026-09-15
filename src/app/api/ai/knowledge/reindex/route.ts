@@ -3,6 +3,7 @@ import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
+import { authenticatedAiContext } from '@/lib/ai/execution-context'
 import { AiError } from '@/lib/ai/types'
 
 /**
@@ -15,7 +16,9 @@ import { AiError } from '@/lib/ai/types'
  */
 export async function POST() {
   try {
-    const { supabase, accountId, userId } = await requireRole('admin')
+    const account = await requireRole('admin')
+    const { supabase, accountId, userId } = account
+    const context = authenticatedAiContext(account)
     const limit = checkRateLimit(`ai-kb-reindex:${userId}`, RATE_LIMITS.adminAction)
     if (!limit.success) return rateLimitResponse(limit)
 
@@ -31,9 +34,8 @@ export async function POST() {
       )
     }
 
-    const { key: embeddingsApiKey, corrupt } = await loadEmbeddingsKey(
-      supabase,
-      accountId,
+    const { key: embeddingsApiKey, corrupt, provider } = await loadEmbeddingsKey(
+      context,
     )
     // The whole point of Reindex is usually to backfill embeddings — so
     // if a key is configured but can't be decrypted, don't quietly do a
@@ -53,7 +55,7 @@ export async function POST() {
     let reindexed = 0
     for (const doc of docs ?? []) {
       try {
-        await ingestDocument(supabase, accountId, { embeddingsApiKey }, doc.id, doc.content)
+        await ingestDocument(context, { embeddingsApiKey, provider }, doc.id, doc.content)
         reindexed += 1
       } catch (err) {
         // One bad document (e.g. a mid-run embeddings rate-limit) should

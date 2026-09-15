@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { generateReply, parseGeneration } from './generate'
 import { AiError, type AiConfig } from './types'
+import { testContext } from './test-helpers'
+
+const context = testContext()
 
 function config(overrides: Partial<AiConfig> = {}): AiConfig {
   return {
@@ -81,6 +84,7 @@ describe('generateReply — OpenAI', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const res = await generateReply({
+      context,
       config: config({ provider: 'openai' }),
       systemPrompt: 'sys',
       messages: [{ role: 'user', content: 'Hi' }],
@@ -106,6 +110,7 @@ describe('generateReply — OpenAI', () => {
 
     await expect(
       generateReply({
+        context,
         config: config(),
         systemPrompt: 'sys',
         messages: [{ role: 'user', content: 'Hi' }],
@@ -120,6 +125,7 @@ describe('generateReply — OpenAI', () => {
     )
     await expect(
       generateReply({
+        context,
         config: config(),
         systemPrompt: 'sys',
         messages: [{ role: 'user', content: 'Hi' }],
@@ -139,6 +145,7 @@ describe('generateReply — Anthropic', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const res = await generateReply({
+      context,
       config: config({ provider: 'anthropic', apiKey: 'sk-ant-x' }),
       systemPrompt: 'sys',
       messages: [{ role: 'user', content: 'Hello' }],
@@ -164,6 +171,7 @@ describe('generateReply — Anthropic', () => {
       ),
     )
     const res = await generateReply({
+      context,
       config: config({ provider: 'anthropic' }),
       systemPrompt: 'sys',
       messages: [{ role: 'user', content: 'I want to speak to a person' }],
@@ -179,6 +187,7 @@ describe('generateReply — Anthropic', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await generateReply({
+      context,
       config: config({ provider: 'anthropic' }),
       systemPrompt: 'sys',
       messages: [

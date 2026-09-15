@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 // so the vi.mock factory below can close over it.
 const h = vi.hoisted(() => ({
   state: {
+    dealError: false,
     owned: null as { id: string } | null,
     ownedCustomField: null as { id: string } | null,
     automations: [] as Record<string, unknown>[],
@@ -26,6 +27,7 @@ vi.mock("./admin-client", () => {
     filters: [string, string, unknown][];
   }) {
     const { table, type } = ops;
+    if (table === "deals" && type === "insert") return { data: state.dealError ? null : { id: "deal1" }, error: state.dealError ? { message: "insert failed" } : null };
     if (table === "contacts") {
       if (type === "update") {
         state.updateCalls.push({ table, filters: ops.filters });
@@ -110,6 +112,7 @@ import type { Automation, KeywordMatchTriggerConfig } from "@/types";
 const ACCOUNT = "acct-1";
 
 beforeEach(() => {
+  h.state.dealError = false;
   h.state.owned = null;
   h.state.ownedCustomField = null;
   h.state.automations = [];
@@ -119,6 +122,18 @@ beforeEach(() => {
   h.state.upsertCalls = [];
   h.state.logInserts = [];
   h.state.logUpdates = [];
+});
+
+describe("create_deal confirmed outcome", () => {
+  it.each([false, true])("records insert failure truthfully: %s", async (failed) => {
+    h.state.owned = { id: "c1" };
+    h.state.dealError = failed;
+    h.state.automations = [automationWithUpdateStep()];
+    h.state.steps = [{ ...updateStep(), step_type: "create_deal", step_config: { pipeline_id: "p1", stage_id: "s1", title: "Enquiry" } }];
+    await runAutomationsForTrigger({ accountId: ACCOUNT, triggerType: "new_message_received", contactId: "c1", context: {} });
+    expect(h.state.logUpdates.filter(u => "status" in u).at(-1)?.status).toBe(failed ? "failed" : "success");
+    if (failed) expect(JSON.stringify(h.state.logUpdates)).not.toContain("deal created");
+  });
 });
 
 describe("runAutomationsForTrigger — tenant isolation", () => {

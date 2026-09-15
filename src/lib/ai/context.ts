@@ -1,4 +1,4 @@
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { requireAiConversation, type AiExecutionContext } from './execution-context'
 import type { ChatMessage } from './types'
 import { aiContextMessageLimit } from './defaults'
 
@@ -17,13 +17,16 @@ interface DbMessage {
  * naturally and the most recent customer message lands last.
  */
 export async function buildConversationContext(
-  db: SupabaseClient,
+  context: AiExecutionContext,
   conversationId: string,
   limit: number = aiContextMessageLimit(),
 ): Promise<ChatMessage[]> {
+  await requireAiConversation(context, conversationId)
+  const { db, accountId } = context
   const { data, error } = await db
     .from('messages')
-    .select('sender_type, content_text')
+    .select('sender_type, content_text, conversations!inner(account_id)')
+    .eq('conversations.account_id', accountId)
     .eq('conversation_id', conversationId)
     .eq('content_type', 'text')
     .order('created_at', { ascending: false })

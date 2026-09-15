@@ -1,21 +1,26 @@
 // ============================================================
-// Shared types for the AI reply assistant (bring-your-own-key).
+// Shared types for the AI reply assistant (local or bring-your-own-key).
 //
 // One small provider-agnostic surface so the inbox draft route and the
 // inbound auto-reply bot both talk to `generateReply` without caring
-// whether the account is on OpenAI or Anthropic.
+// which provider the account uses.
 // ============================================================
 
-export type AiProvider = 'openai' | 'anthropic'
+export type AiProvider = 'openai' | 'anthropic' | 'ollama'
+
+export function isAiProvider(value: unknown): value is AiProvider {
+  return value === 'openai' || value === 'anthropic' || value === 'ollama'
+}
 
 /**
  * Account AI setup, decrypted and ready to use. Produced by
  * `loadAiConfig` — `apiKey` is the plaintext BYO provider key
- * (stored AES-256-GCM-encrypted at rest).
+ * (stored AES-256-GCM-encrypted at rest), or empty for local Ollama.
  */
 export interface AiConfig {
   provider: AiProvider
   model: string
+  /** Empty for operator-managed Ollama; never forwarded to Ollama. */
   apiKey: string
   systemPrompt: string | null
   isActive: boolean
@@ -27,11 +32,12 @@ export interface AiConfig {
   handoffAgentId: string | null
   /** Optional OpenAI-compatible key for embeddings. When set, the
    *  knowledge base is embedded and semantic retrieval turns on; when
-   *  null, retrieval falls back to lexical full-text search. */
+   *  null, paid-provider accounts use lexical search. Ollama instead uses
+   *  the operator-controlled local embedding model, never this key. */
   embeddingsApiKey: string | null
 }
 
-/** A single conversation turn in the shape both providers accept. */
+/** A single conversation turn in the shared provider shape. */
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
@@ -56,6 +62,8 @@ export interface ProviderResult {
 
 /** Outcome of a generation call. */
 export interface GenerateResult {
+  /** Internal provenance only; never treated as semantic proof of correctness. */
+  grounding?: { status: 'cited' | 'unsupported' | 'no_knowledge'; sourceIds: string[] }
   /** The reply text, with any handoff sentinel stripped. */
   text: string
   /** True when the model asked to hand off to a human (auto-reply mode). */

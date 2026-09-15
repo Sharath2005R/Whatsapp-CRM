@@ -6,16 +6,17 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: (v: string) => `plain:${v}`,
 }))
 
-import { loadAiConfig } from './config'
+import { loadAiConfig, loadEmbeddingsKey } from './config'
+import { testContext } from './test-helpers'
 
-function dbReturning(row: Record<string, unknown> | null): SupabaseClient {
+function dbReturning(row: Record<string, unknown> | null) {
   const chain = {
     from: () => chain,
     select: () => chain,
     eq: () => chain,
     maybeSingle: () => Promise.resolve({ data: row, error: null }),
   }
-  return chain as unknown as SupabaseClient
+  return testContext(chain as unknown as SupabaseClient)
 }
 
 const ROW = {
@@ -30,12 +31,39 @@ const ROW = {
 }
 
 describe('loadAiConfig requireActive', () => {
+  it('loads Ollama without a key and suppresses any legacy paid embeddings key', async () => {
+    const db = dbReturning({
+      ...ROW,
+      provider: 'ollama',
+      api_key: null,
+      is_active: true,
+      embeddings_api_key: 'old-paid-key',
+    })
+    expect(await loadAiConfig(db)).toMatchObject({
+      provider: 'ollama',
+      apiKey: '',
+      embeddingsApiKey: null,
+    })
+    expect(await loadEmbeddingsKey(db)).toEqual({
+      key: null,
+      corrupt: false,
+      provider: 'ollama',
+    })
+  })
+
+  it('still requires a key for existing paid providers', async () => {
+    expect(
+      await loadAiConfig(
+        dbReturning({ ...ROW, is_active: true, api_key: null }),
+      ),
+    ).toBeNull()
+  })
   it('returns null for an inactive config by default', async () => {
-    expect(await loadAiConfig(dbReturning(ROW), 'acct')).toBeNull()
+    expect(await loadAiConfig(dbReturning(ROW))).toBeNull()
   })
 
   it('returns the config when requireActive is false (Playground path)', async () => {
-    const config = await loadAiConfig(dbReturning(ROW), 'acct', {
+    const config = await loadAiConfig(dbReturning(ROW), {
       requireActive: false,
     })
     expect(config).not.toBeNull()
@@ -45,7 +73,7 @@ describe('loadAiConfig requireActive', () => {
 
   it('returns null when there is no row', async () => {
     expect(
-      await loadAiConfig(dbReturning(null), 'acct', { requireActive: false }),
+      await loadAiConfig(dbReturning(null), { requireActive: false }),
     ).toBeNull()
   })
 })

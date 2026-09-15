@@ -1,9 +1,14 @@
 import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
-import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
+import {
+  checkRateLimit,
+  rateLimitResponse,
+  RATE_LIMITS,
+} from '@/lib/rate-limit'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { validateAiCredentials } from '@/lib/ai/validate'
-import { AiError, type AiProvider } from '@/lib/ai/types'
+import { authenticatedAiContext } from '@/lib/ai/execution-context'
+import { AiError, isAiProvider } from '@/lib/ai/types'
 
 /**
  * POST /api/ai/test  (admin+)
@@ -16,20 +21,25 @@ import { AiError, type AiProvider } from '@/lib/ai/types'
  */
 export async function POST(request: Request) {
   try {
-    const { supabase, accountId, userId } = await requireRole('admin')
+    const account = await requireRole('admin')
+    const { supabase, accountId, userId } = account
+    const context = authenticatedAiContext(account)
 
     const limit = checkRateLimit(`ai-test:${userId}`, RATE_LIMITS.adminAction)
     if (!limit.success) return rateLimitResponse(limit)
 
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') {
-      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+      return NextResponse.json(
+        { error: 'Invalid request body' },
+        { status: 400 },
+      )
     }
 
-    const provider = body.provider as AiProvider
-    if (provider !== 'openai' && provider !== 'anthropic') {
+    const provider = body.provider
+    if (!isAiProvider(provider)) {
       return NextResponse.json(
-        { error: 'provider must be "openai" or "anthropic"' },
+        { error: 'provider must be "ollama", "openai" or "anthropic"' },
         { status: 400 },
       )
     }
@@ -39,8 +49,14 @@ export async function POST(request: Request) {
     }
 
     const rawKey = typeof body.api_key === 'string' ? body.api_key.trim() : ''
+    if (provider === 'ollama' && rawKey) {
+      return NextResponse.json(
+        { error: 'Ollama does not accept account API keys.' },
+        { status: 400 },
+      )
+    }
     let apiKeyPlain = rawKey
-    if (!apiKeyPlain) {
+    if (provider !== 'ollama' && !apiKeyPlain) {
       const { data: existing } = await supabase
         .from('ai_configs')
         .select('api_key')
@@ -56,14 +72,16 @@ export async function POST(request: Request) {
         apiKeyPlain = decrypt(existing.api_key)
       } catch {
         return NextResponse.json(
-          { error: 'Stored API key could not be decrypted — re-enter your key.' },
+          {
+            error: 'Stored API key could not be decrypted — re-enter your key.',
+          },
           { status: 400 },
         )
       }
     }
 
     try {
-      await validateAiCredentials({
+      await validateAiCredentials(context, {
         provider,
         model,
         apiKey: apiKeyPlain,

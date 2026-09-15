@@ -12,3 +12,13 @@ export function latestUserMessage(messages: ChatMessage[]): string {
   }
   return messages.length > 0 ? messages[messages.length - 1].content : ''
 }
+
+/** Keep the latest question primary; previous customer text resolves follow-ups.
+ * Never use assistant-generated facts as retrieval authority. */
+export function knowledgeQuery(messages: ChatMessage[]): string {
+  const turns = messages.filter(message => message.role === 'user').slice(-2)
+  const latest = turns.at(-1)?.content.trim() ?? ''
+  if (!latest) return ''
+  if (turns.length < 2 || latest.length > 160) return latest.slice(0, 1600)
+  return `${latest.slice(0, 1000)}\nPrevious customer context: ${turns[0].content.slice(0, 500)}`
+}

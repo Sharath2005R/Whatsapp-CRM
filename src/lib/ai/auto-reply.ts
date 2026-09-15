@@ -3,10 +3,11 @@ import { loadAiConfig } from './config'
 import { buildConversationContext } from './context'
 import { retrieveKnowledge } from './knowledge'
 import { generateReply } from './generate'
-import { buildSystemPrompt } from './defaults'
+import { buildSystemPrompt, withKnowledgeReferences } from './defaults'
+import { whatsappAiContext, requireAiConversation } from './execution-context'
 import { buildHandoffSummary } from './handoff'
 import { logAiUsage } from './usage'
-import { latestUserMessage } from './query'
+import { knowledgeQuery } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit'
 
@@ -46,8 +47,10 @@ export async function dispatchInboundToAiReply(
 
   try {
     const db = supabaseAdmin()
+    const context = await whatsappAiContext(db, accountId, configOwnerUserId)
+    const conv = await requireAiConversation(context, conversationId, contactId)
 
-    const config = await loadAiConfig(db, accountId)
+    const config = await loadAiConfig(context)
     if (!config || !config.autoReplyEnabled) return
 
     // Deterministic, user-configured responders win over the LLM — the
@@ -58,28 +61,21 @@ export async function dispatchInboundToAiReply(
     // avoid double-texting the customer. (Relationship triggers like
     // `first_inbound_message` don't count — they're not per-message
     // auto-responders.)
-    const { data: autoResponders } = await db
+    const { data: autoResponders, error: automationError } = await db
       .from('automations')
       .select('id')
       .eq('account_id', accountId)
       .eq('is_active', true)
       .in('trigger_type', ['new_message_received', 'keyword_match'])
       .limit(1)
-    if (autoResponders && autoResponders.length > 0) return
-
-    const { data: conv, error: convErr } = await db
-      .from('conversations')
-      .select('assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
-      .eq('id', conversationId)
-      .maybeSingle()
-    if (convErr || !conv) return
+    if (automationError || (autoResponders && autoResponders.length > 0)) return
     if (conv.assigned_agent_id) return // a human owns this thread
     if (conv.ai_autoreply_disabled) return // handed off / turned off here
     // Cheap early-out; the authoritative cap check is the atomic claim
     // below (this read can race a concurrent inbound).
     if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
 
-    const messages = await buildConversationContext(db, conversationId)
+    const messages = await buildConversationContext(context, conversationId)
     if (messages.length === 0) return
 
     // Account-wide throttle on the shared BYO key. The per-conversation
@@ -100,22 +96,25 @@ export async function dispatchInboundToAiReply(
 
     // Ground the reply in the account's knowledge base (best-effort).
     const knowledge = await retrieveKnowledge(
-      db,
-      accountId,
+      context,
       config,
-      latestUserMessage(messages),
+      knowledgeQuery(messages),
     )
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
-      knowledge,
+      businessName: context.businessName,
+      hasKnowledge: knowledge.length > 0,
     })
 
     const { text, handoff, usage } = await generateReply({
+      toolConversationId: process.env.AI_BUSINESS_TOOLS_ENABLED === '1' ? conversationId : undefined,
+      knowledge,
+      context,
       config,
       systemPrompt,
-      messages,
+      messages: withKnowledgeReferences(messages, knowledge),
     })
 
     // Record token spend on the account's BYO key. Fire-and-forget so it
@@ -151,9 +150,13 @@ export async function dispatchInboundToAiReply(
       // Only set the assignee when a target is configured AND the thread
       // isn't already owned — never stomp an existing human assignment.
       if (config.handoffAgentId && !conv.assigned_agent_id) {
-        update.assigned_agent_id = config.handoffAgentId
+        const { data: member, error } = await db.from('profiles').select('user_id')
+          .eq('account_id', accountId).eq('user_id', config.handoffAgentId).maybeSingle()
+        if (!error && member) update.assigned_agent_id = config.handoffAgentId
       }
-      await db.from('conversations').update(update).eq('id', conversationId)
+      await requireAiConversation(context, conversationId, contactId)
+      await db.from('conversations').update(update).eq('account_id', accountId)
+        .eq('id', conversationId).eq('contact_id', contactId).is('assigned_agent_id', null)
       return
     }
 
@@ -163,22 +166,26 @@ export async function dispatchInboundToAiReply(
     // skip the send. (We consume a slot slightly before the send lands —
     // fail-safe: under-reply rather than over-reply.)
     const { data: claimed, error: claimErr } = await db.rpc(
-      'claim_ai_reply_slot',
+      'claim_ai_reply_slot_for_account',
       {
+        p_account_id: accountId,
+        p_contact_id: contactId,
         conversation_id: conversationId,
         max_replies: config.autoReplyMaxPerConversation,
       },
     )
     if (claimErr) {
       // A real error here (vs. losing the cap race) is almost always a
-      // deploy issue — e.g. `claim_ai_reply_slot` not EXECUTE-able by the
+      // deploy issue — e.g. the account-scoped RPC not EXECUTE-able by the
       // service role, or the migration not applied. Log it loudly: a
       // silent return makes "auto-reply never fires" undiagnosable.
-      console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr)
+      console.error('[ai auto-reply] claim_ai_reply_slot_for_account failed:', claimErr)
       return
     }
     if (claimed !== true) return // lost the per-conversation cap race
 
+    const current = await requireAiConversation(context, conversationId, contactId)
+    if (current.assigned_agent_id || current.ai_autoreply_disabled) return
     await engineSendText({
       accountId,
       userId: configOwnerUserId,

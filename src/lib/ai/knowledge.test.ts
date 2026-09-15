@@ -1,160 +1,253 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  retrieveKnowledge,
+  ingestDocument,
+  type KnowledgeSource,
+} from './knowledge'
+import { tenantDatabase, testContext } from './test-helpers'
 
 const h = vi.hoisted(() => ({ embedTexts: vi.fn() }))
 vi.mock('./embeddings', () => ({
   embedTexts: h.embedTexts,
-  toVectorLiteral: (v: number[]) => `[${v.join(',')}]`,
+  toVectorLiteral: (v: number[]) => JSON.stringify(v),
 }))
-
-import { retrieveKnowledge, ingestDocument } from './knowledge'
-
-interface FakeState {
-  semantic: { id: string; content: string }[]
-  fts: { id: string; content: string }[]
-  chunkCount: number
-  rpcCalls: string[]
-  inserted: Record<string, unknown>[] | null
-  deletedFor: string | null
-}
-
-function makeDb() {
-  const state: FakeState = {
-    semantic: [],
-    fts: [],
-    chunkCount: 5, // account has a non-empty KB by default
-    rpcCalls: [],
-    inserted: null,
-    deletedFor: null,
-  }
-  const db = {
-    rpc: (name: string) => {
-      state.rpcCalls.push(name)
-      if (name === 'match_ai_knowledge_semantic')
-        return Promise.resolve({ data: state.semantic, error: null })
-      if (name === 'match_ai_knowledge_fts')
-        return Promise.resolve({ data: state.fts, error: null })
-      return Promise.resolve({ data: null, error: null })
-    },
-    from: () => ({
-      // retrieveKnowledge's empty-KB count guard.
-      select: () => ({
-        eq: () => Promise.resolve({ count: state.chunkCount, error: null }),
-      }),
-      delete: () => ({
-        eq: (_col: string, val: string) => {
-          state.deletedFor = val
-          return Promise.resolve({ error: null })
-        },
-      }),
-      insert: (rows: Record<string, unknown>[]) => {
-        state.inserted = rows
-        return Promise.resolve({ error: null })
-      },
-    }),
-  }
-  return { db: db as unknown as SupabaseClient, state }
-}
-
+const source = (
+  account: string,
+  content: string,
+): KnowledgeSource & { account_id: string } => ({
+  id: account + '-chunk',
+  document_id: account + '-doc',
+  title: 'Kerala',
+  content,
+  score: 0.9,
+  method: 'semantic',
+  account_id: account,
+})
 beforeEach(() => {
   h.embedTexts.mockReset()
-  h.embedTexts.mockImplementation(async (_key: string, inputs: string[]) =>
-    inputs.map((_, i) => [i, i]),
+  h.embedTexts.mockImplementation(async (config, inputs: string[]) =>
+    inputs.map(() =>
+      Array(config.provider === 'ollama' ? 1024 : 1536).fill(0.1),
+    ),
   )
+  vi.stubEnv('AI_KNOWLEDGE_MIN_SIMILARITY', '0.65')
+})
+afterEach(() => vi.unstubAllEnvs())
+
+function setup() {
+  const fixture = tenantDatabase()
+  const sources = [
+    source('acct', 'Kerala package = ₹25,000'),
+    source('foreign', 'Kerala package = ₹40,000'),
+  ]
+  fixture.rows.ai_knowledge_chunks = sources.map((value) => ({ ...value }))
+  const rpc = vi.spyOn(fixture.db, 'rpc').mockImplementation((name, args) => {
+    const params = args as Record<string, unknown>
+    const data =
+      name === 'match_ai_knowledge_v2'
+        ? sources.filter((s) => s.account_id === params.p_account_id)
+        : null
+    return Promise.resolve({ data, error: null }) as never
+  })
+  return { ...fixture, sources, rpc, context: testContext(fixture.db) }
+}
+
+describe('tenant-isolated retrieval', () => {
+  it('returns only Business A sources and retains provenance', async () => {
+    const { context, rpc } = setup()
+    const hits = await retrieveKnowledge(
+      context,
+      { provider: 'ollama', embeddingsApiKey: null },
+      'Kerala package price',
+    )
+    expect(hits).toHaveLength(1)
+    expect(hits[0]).toMatchObject({
+      document_id: 'acct-doc',
+      content: 'Kerala package = ₹25,000',
+    })
+    expect(JSON.stringify(hits)).not.toContain('40,000')
+    expect(rpc).toHaveBeenCalledWith(
+      'match_ai_knowledge_v2',
+      expect.objectContaining({ p_account_id: 'acct' }),
+    )
+  })
+  it('uses local embedding space and never selects an existing paid key for Ollama', async () => {
+    const { context, rpc } = setup()
+    await retrieveKnowledge(
+      context,
+      { provider: 'ollama', embeddingsApiKey: 'old-paid-key' },
+      'price',
+    )
+    expect(h.embedTexts.mock.calls[0][0].provider).toBe('ollama')
+    expect(rpc).toHaveBeenCalledWith(
+      'match_ai_knowledge_v2',
+      expect.objectContaining({
+        p_embedding_space: 'qwen3-embedding:0.6b:1024:retrieval-v1',
+      }),
+    )
+  })
+  it('preserves existing paid semantic embeddings', async () => {
+    const { context, rpc } = setup()
+    await retrieveKnowledge(
+      context,
+      { provider: 'anthropic', embeddingsApiKey: 'paid-key' },
+      'price',
+    )
+    expect(h.embedTexts.mock.calls[0][0]).toEqual({
+      provider: 'openai',
+      apiKey: 'paid-key',
+    })
+    expect(rpc).toHaveBeenCalledWith(
+      'match_ai_knowledge_v2',
+      expect.objectContaining({
+        p_embedding_space: 'openai:text-embedding-3-small:1536',
+      }),
+    )
+  })
+  it('retains lexical-only behavior without a paid key', async () => {
+    const { context, rpc } = setup()
+    await retrieveKnowledge(
+      context,
+      { provider: 'openai', embeddingsApiKey: null },
+      'Kerala',
+    )
+    expect(h.embedTexts).not.toHaveBeenCalled()
+    expect(rpc).toHaveBeenCalledWith(
+      'match_ai_knowledge_v2',
+      expect.objectContaining({ p_query_embedding: null }),
+    )
+  })
+  it('uses only tenant lexical search after local embedding failure', async () => {
+    const { context, rpc } = setup()
+    h.embedTexts.mockRejectedValue(new Error('offline'))
+    await retrieveKnowledge(
+      context,
+      { provider: 'ollama', embeddingsApiKey: null },
+      'Kerala',
+    )
+    expect(h.embedTexts).toHaveBeenCalledTimes(1)
+    expect(rpc).toHaveBeenCalledWith(
+      'match_ai_knowledge_v2',
+      expect.objectContaining({
+        p_query_embedding: null,
+        p_account_id: 'acct',
+      }),
+    )
+  })
+  it('rejects low relevance and missing results', async () => {
+    const { context, sources } = setup()
+    sources[0].score = 0.2
+    expect(
+      await retrieveKnowledge(context, { embeddingsApiKey: null }, 'unrelated'),
+    ).toEqual([])
+  })
+  it('does not call embeddings or retrieval on an empty knowledge base', async () => {
+    const { context, rows, rpc } = setup()
+    rows.ai_knowledge_chunks = []
+    expect(
+      await retrieveKnowledge(
+        context,
+        { provider: 'ollama', embeddingsApiKey: null },
+        'question',
+      ),
+    ).toEqual([])
+    expect(h.embedTexts).not.toHaveBeenCalled()
+    expect(rpc).not.toHaveBeenCalled()
+  })
+  it('treats multilingual query text as data without changing account identity', async () => {
+    const { context, rpc } = setup()
+    await retrieveKnowledge(
+      context,
+      { provider: 'ollama', embeddingsApiKey: null },
+      'केरल पैकेज की कीमत क्या है?',
+    )
+    expect(rpc).toHaveBeenCalledWith(
+      'match_ai_knowledge_v2',
+      expect.objectContaining({
+        p_account_id: 'acct',
+        p_query: 'केरल पैकेज की कीमत क्या है?',
+      }),
+    )
+  })
 })
 
-describe('retrieveKnowledge', () => {
-  it('returns [] for an empty query without touching the DB', async () => {
-    const { db, state } = makeDb()
-    expect(await retrieveKnowledge(db, 'acct', { embeddingsApiKey: null }, '  ')).toEqual([])
-    expect(state.rpcCalls).toEqual([])
+describe('owned document indexing', () => {
+  it('writes local vectors in one account-scoped RPC, not the OpenAI column', async () => {
+    const { context, rpc } = setup()
+    await ingestDocument(
+      context,
+      { provider: 'ollama', embeddingsApiKey: null },
+      'doc',
+      'local knowledge',
+    )
+    const params = rpc.mock.calls[0][1] as Record<string, unknown>
+    expect(params).toMatchObject({ p_account_id: 'acct', p_document_id: 'doc' })
+    const chunk = (params.p_chunks as Record<string, unknown>[])[0]
+    expect(chunk.embedding).toBeNull()
+    expect(JSON.parse(chunk.local_embedding as string)).toHaveLength(1024)
   })
-
-  it('short-circuits (no embed, no RPC) when the KB is empty', async () => {
-    const { db, state } = makeDb()
-    state.chunkCount = 0
-    const out = await retrieveKnowledge(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'q')
-    expect(out).toEqual([])
-    expect(h.embedTexts).not.toHaveBeenCalled()
-    expect(state.rpcCalls).toEqual([])
+  it('writes existing OpenAI vectors without local vectors', async () => {
+    const { context, rpc } = setup()
+    await ingestDocument(
+      context,
+      { provider: 'openai', embeddingsApiKey: 'key' },
+      'doc',
+      'knowledge',
+    )
+    const params = rpc.mock.calls[0][1] as Record<string, unknown>
+    const chunk = (params.p_chunks as Record<string, unknown>[])[0]
+    expect(JSON.parse(chunk.embedding as string)).toHaveLength(1536)
+    expect(chunk.local_embedding).toBeNull()
   })
-
-  it('uses lexical FTS only when there is no embeddings key', async () => {
-    const { db, state } = makeDb()
-    state.fts = [{ id: 'f1', content: 'F1' }]
-    const out = await retrieveKnowledge(db, 'acct', { embeddingsApiKey: null }, 'q')
-    expect(out).toEqual(['F1'])
-    expect(state.rpcCalls).toEqual(['match_ai_knowledge_fts'])
-    expect(h.embedTexts).not.toHaveBeenCalled()
-  })
-
-  it('uses semantic search when an embeddings key is present', async () => {
-    const { db, state } = makeDb()
-    state.semantic = [
-      { id: 's1', content: 'S1' },
-      { id: 's2', content: 'S2' },
-      { id: 's3', content: 'S3' },
-    ]
-    const out = await retrieveKnowledge(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'q', 3)
-    expect(out).toEqual(['S1', 'S2', 'S3'])
-    expect(h.embedTexts).toHaveBeenCalledTimes(1)
-    // Enough semantic hits → no FTS top-up.
-    expect(state.rpcCalls).toEqual(['match_ai_knowledge_semantic'])
-  })
-
-  it('tops up with FTS and dedupes when semantic is short', async () => {
-    const { db, state } = makeDb()
-    state.semantic = [
-      { id: 's1', content: 'S1' },
-      { id: 's2', content: 'S2' },
-    ]
-    state.fts = [
-      { id: 's2', content: 'S2-dup' }, // dedup by id
-      { id: 'f1', content: 'F1' },
-    ]
-    const out = await retrieveKnowledge(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'q', 3)
-    expect(out).toEqual(['S1', 'S2', 'F1'])
-    expect(state.rpcCalls).toEqual([
-      'match_ai_knowledge_semantic',
-      'match_ai_knowledge_fts',
-    ])
-  })
-})
-
-describe('ingestDocument', () => {
-  it('embeds chunks when a key is present', async () => {
-    const { db, state } = makeDb()
-    await ingestDocument(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'doc-1', 'hello world')
-    expect(h.embedTexts).toHaveBeenCalledTimes(1)
-    expect(state.deletedFor).toBe('doc-1')
-    expect(state.inserted).toHaveLength(1)
-    expect(state.inserted![0].embedding).toBe('[0,0]') // literal from mocked embed
-    expect(state.inserted![0].account_id).toBe('acct')
-  })
-
-  it('stores chunks without embeddings when there is no key', async () => {
-    const { db, state } = makeDb()
-    await ingestDocument(db, 'acct', { embeddingsApiKey: null }, 'doc-1', 'hello world')
-    expect(h.embedTexts).not.toHaveBeenCalled()
-    expect(state.inserted![0].embedding).toBeNull()
-  })
-
-  it('deletes existing chunks and inserts nothing for empty content', async () => {
-    const { db, state } = makeDb()
-    await ingestDocument(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'doc-1', '   ')
-    expect(state.deletedFor).toBe('doc-1')
-    expect(state.inserted).toBeNull()
-    expect(h.embedTexts).not.toHaveBeenCalled()
-  })
-
-  it('still stores lexical chunks when embedding fails, then rethrows', async () => {
-    const { db, state } = makeDb()
-    h.embedTexts.mockRejectedValueOnce(new Error('rate limited'))
+  it('saves current lexical chunks after embedding failure, then reports the failure', async () => {
+    const { context, rpc } = setup()
+    h.embedTexts.mockRejectedValue(new Error('offline'))
     await expect(
-      ingestDocument(db, 'acct', { embeddingsApiKey: 'sk-x' }, 'doc-1', 'hello world'),
-    ).rejects.toThrow('rate limited')
-    // Chunks were inserted (lexical search works) despite the embed failure…
-    expect(state.inserted).toHaveLength(1)
-    expect(state.inserted![0].embedding).toBeNull()
+      ingestDocument(
+        context,
+        { provider: 'ollama', embeddingsApiKey: null },
+        'doc',
+        'knowledge',
+      ),
+    ).rejects.toThrow('offline')
+    expect(rpc).toHaveBeenCalledWith(
+      'replace_ai_knowledge_chunks',
+      expect.objectContaining({
+        p_chunks: [
+          expect.objectContaining({
+            content: 'knowledge',
+            local_embedding: null,
+          }),
+        ],
+      }),
+    )
+  })
+  it('rejects foreign documents before embedding or writes', async () => {
+    const { context, rows, rpc } = setup()
+    rows.ai_knowledge_documents[0].account_id = 'foreign'
+    await expect(
+      ingestDocument(
+        context,
+        { provider: 'ollama', embeddingsApiKey: null },
+        'doc',
+        'attack',
+      ),
+    ).rejects.toMatchObject({ status: 404 })
+    expect(h.embedTexts).not.toHaveBeenCalled()
+    expect(rpc).not.toHaveBeenCalled()
+  })
+  it('surfaces failed atomic writes without claiming indexing success', async () => {
+    const { context, rpc } = setup()
+    rpc.mockImplementation(
+      () => Promise.resolve({ data: null, error: { code: '40001' } }) as never,
+    )
+    await expect(
+      ingestDocument(
+        context,
+        { embeddingsApiKey: null },
+        'doc',
+        'stale document',
+      ),
+    ).rejects.toMatchObject({ code: 'indexing_failed' })
   })
 })

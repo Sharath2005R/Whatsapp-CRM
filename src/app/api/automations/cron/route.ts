@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/automations/admin-client'
 import { resumePendingExecution } from '@/lib/automations/engine'
 import type { AutomationContext } from '@/lib/automations/engine'
+import { drainFollowups } from '@/lib/followups/worker'
 
 /**
  * Drain due `automation_pending_executions` rows. Meant to be hit
@@ -31,16 +32,23 @@ export async function GET(request: Request) {
   }
 
   const admin = supabaseAdmin()
+  const followupsEnabled = process.env.AI_FOLLOWUPS_ENABLED === '1'
+  let followups = 0
+  if (followupsEnabled) {
+    try { followups = await drainFollowups(admin) }
+    catch { return NextResponse.json({ error: 'Follow-up processing failed' }, { status: 503 }) }
+  }
   const { data: due, error } = await admin
     .from('automation_pending_executions')
     .select('*')
     .eq('status', 'pending')
+    .not('automation_id', 'is', null)
     .lte('run_at', new Date().toISOString())
     .order('run_at', { ascending: true })
     .limit(50)
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  if (!due || due.length === 0) return NextResponse.json({ processed: 0 })
+  if (!due || due.length === 0) return NextResponse.json({ processed: 0, followups })
 
   let processed = 0
   for (const row of due) {
@@ -70,5 +78,5 @@ export async function GET(request: Request) {
     processed++
   }
 
-  return NextResponse.json({ processed })
+  return NextResponse.json({ processed, followups })
 }

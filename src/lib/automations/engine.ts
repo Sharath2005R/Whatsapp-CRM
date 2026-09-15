@@ -125,7 +125,7 @@ export async function runAutomationsForTrigger(input: DispatchInput): Promise<vo
 export async function resumePendingExecution(pending: {
   id: string
   automation_id: string
-  /** Audit-only; the automation row carries account_id for tenancy. */
+    /** Audit-only; the automation row carries account_id for tenancy. */
   user_id: string
   /** Account-scoped lookups read from the automation row, so this
    *  field is just here to mirror the row shape and keep the cron's
@@ -143,6 +143,8 @@ export async function resumePendingExecution(pending: {
     .from('automations')
     .select('*')
     .eq('id', pending.automation_id)
+    .eq('account_id', pending.account_id)
+    .eq('is_active', true)
     .single()
 
   if (error || !automation) {
@@ -569,7 +571,7 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
         .select('default_currency')
         .eq('id', args.automation.account_id)
         .maybeSingle()
-      await db.from('deals').insert({
+      const { data: createdDeal, error: dealError } = await db.from('deals').insert({
         // Tenancy + audit, same split as automation_logs above.
         account_id: args.automation.account_id,
         user_id: args.automation.user_id,
@@ -581,6 +583,8 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
         currency: acct?.default_currency ?? 'USD',
         status: 'open',
       })
+      .select('id').single()
+      if (dealError || !createdDeal?.id) throw new Error('Deal creation failed')
       return 'deal created'
     }
 

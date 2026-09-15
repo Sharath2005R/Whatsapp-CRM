@@ -4,11 +4,16 @@ import {
   requireRole,
   toErrorResponse,
 } from '@/lib/auth/account'
-import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
+import {
+  checkRateLimit,
+  rateLimitResponse,
+  RATE_LIMITS,
+} from '@/lib/rate-limit'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
 import { validateAiCredentials } from '@/lib/ai/validate'
+import { authenticatedAiContext } from '@/lib/ai/execution-context'
 import { embedTexts } from '@/lib/ai/embeddings'
-import { AiError, type AiProvider } from '@/lib/ai/types'
+import { AiError, isAiProvider } from '@/lib/ai/types'
 
 function bad(message: string) {
   return NextResponse.json({ error: message }, { status: 400 })
@@ -69,7 +74,9 @@ export async function GET() {
  */
 export async function POST(request: Request) {
   try {
-    const { supabase, accountId, userId } = await requireRole('admin')
+    const account = await requireRole('admin')
+    const { supabase, accountId, userId } = account
+    const context = authenticatedAiContext(account)
 
     const limit = checkRateLimit(`ai-config:${userId}`, RATE_LIMITS.adminAction)
     if (!limit.success) return rateLimitResponse(limit)
@@ -77,9 +84,9 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => null)
     if (!body || typeof body !== 'object') return bad('Invalid request body')
 
-    const provider = body.provider as AiProvider
-    if (provider !== 'openai' && provider !== 'anthropic') {
-      return bad('provider must be "openai" or "anthropic"')
+    const provider = body.provider
+    if (!isAiProvider(provider)) {
+      return bad('provider must be "ollama", "openai" or "anthropic"')
     }
     const model = typeof body.model === 'string' ? body.model.trim() : ''
     if (!model) return bad('model is required')
@@ -100,7 +107,9 @@ export async function POST(request: Request) {
     // stranger); an empty string / null means "leave unassigned" (the
     // shared queue). Absent → left unchanged on update below.
     const rawHandoff =
-      typeof body.handoff_agent_id === 'string' ? body.handoff_agent_id.trim() : ''
+      typeof body.handoff_agent_id === 'string'
+        ? body.handoff_agent_id.trim()
+        : ''
     const handoffProvided = 'handoff_agent_id' in body
     let handoffAgentId: string | null = null
     if (rawHandoff) {
@@ -110,7 +119,8 @@ export async function POST(request: Request) {
         .eq('account_id', accountId)
         .eq('user_id', rawHandoff)
         .maybeSingle()
-      if (!member) return bad('handoff_agent_id must be a member of this account')
+      if (!member)
+        return bad('handoff_agent_id must be a member of this account')
       handoffAgentId = rawHandoff
     }
 
@@ -124,6 +134,11 @@ export async function POST(request: Request) {
         ? body.embeddings_api_key.trim()
         : ''
     const clearEmbeddingsKey = body.embeddings_api_key === null
+    if (provider === 'ollama' && (rawKey || rawEmbeddingsKey)) {
+      return bad(
+        'Ollama does not accept account API keys or paid embeddings keys.',
+      )
+    }
 
     // Reuse the stored key when the form didn't send a fresh one.
     const { data: existing } = await supabase
@@ -133,7 +148,9 @@ export async function POST(request: Request) {
       .maybeSingle()
 
     let apiKeyPlain: string
-    if (rawKey) {
+    if (provider === 'ollama') {
+      apiKeyPlain = ''
+    } else if (rawKey) {
       apiKeyPlain = rawKey
     } else if (existing?.api_key) {
       try {
@@ -157,7 +174,7 @@ export async function POST(request: Request) {
 
     if (credentialsChanged) {
       try {
-        await validateAiCredentials({
+        await validateAiCredentials(context, {
           provider,
           model,
           apiKey: apiKeyPlain,
@@ -206,6 +223,10 @@ export async function POST(request: Request) {
       auto_reply_enabled: autoReplyEnabled,
       auto_reply_max_per_conversation: maxPer,
     }
+    if (provider === 'ollama') {
+      shared.api_key = null
+      shared.embeddings_api_key = null
+    }
     // Only touch the handoff target when the form actually sent the field,
     // so a partial save (e.g. flipping a toggle) doesn't wipe it.
     if (handoffProvided) shared.handoff_agent_id = handoffAgentId
@@ -231,7 +252,7 @@ export async function POST(request: Request) {
       const { error: insErr } = await supabase.from('ai_configs').insert({
         account_id: accountId,
         created_by: userId,
-        api_key: encryptedKey, // guaranteed non-null: rawKey required when no existing row
+        api_key: encryptedKey,
         ...shared,
       })
       if (insErr) {

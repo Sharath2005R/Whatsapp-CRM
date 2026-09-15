@@ -1,149 +1,158 @@
-import type { SupabaseClient } from '@supabase/supabase-js'
-import type { AiConfig } from './types'
+import { assertAiContext, type AiExecutionContext } from './execution-context'
+import { AiError, type AiConfig } from './types'
 import { chunkText } from './chunk'
 import { embedTexts, toVectorLiteral } from './embeddings'
+import { knowledgeEmbeddingConfig } from './embedding-config'
+import { validateVectors } from './providers/ollama-embeddings'
 
-// ============================================================
-// Knowledge base: ingest (chunk + optionally embed) and hybrid
-// retrieve (semantic when an embeddings key is present, topped up with
-// lexical full-text search).
-// ============================================================
+type KnowledgeConfig = Pick<AiConfig, 'embeddingsApiKey'> &
+  Partial<Pick<AiConfig, 'provider'>>
 
-interface MatchRow {
+export interface KnowledgeSource {
   id: string
+  document_id: string
+  title: string
   content: string
+  score: number
+  method: 'semantic' | 'lexical'
 }
 
-/**
- * (Re)build the chunks for one document. Deletes the document's
- * existing chunks, re-chunks the content, and — when the account has an
- * embeddings key — embeds each chunk. Runs under whatever client the
- * caller passes (service-role for ingest routes).
- *
- * Throws on embedding failure so the ingest route can report it; the
- * chunks are only written once embedding (if attempted) succeeds, so a
- * failed embed never leaves half-indexed rows.
- */
 export async function ingestDocument(
-  db: SupabaseClient,
-  accountId: string,
-  config: Pick<AiConfig, 'embeddingsApiKey'>,
+  context: AiExecutionContext,
+  config: KnowledgeConfig,
   documentId: string,
   content: string,
 ): Promise<void> {
+  assertAiContext(context)
+  const { db, accountId } = context
+  const { data: document, error } = await db
+    .from('ai_knowledge_documents')
+    .select('id')
+    .eq('account_id', accountId)
+    .eq('id', documentId)
+    .maybeSingle()
+  if (error || !document)
+    throw new AiError('Knowledge document not found.', {
+      code: 'document_not_found',
+      status: 404,
+    })
+  if (content.length > 120000)
+    throw new AiError('Document is too large to index in one request.', {
+      code: 'document_too_large',
+      status: 400,
+    })
+
   const chunks = chunkText(content)
-
-  // Replace, don't append — re-ingest must be idempotent.
-  const { error: delErr } = await db
-    .from('ai_knowledge_chunks')
-    .delete()
-    .eq('document_id', documentId)
-  if (delErr) throw delErr
-
-  if (chunks.length === 0) return
-
-  // Embed if a key is set, but DON'T let an embedding failure stop the
-  // chunks from being stored: a failed embed must still leave the
-  // document searchable lexically. We record the error and rethrow it
-  // AFTER inserting (embedding-less) rows, so the route can warn
-  // "semantic indexing failed" — which is now truthful, because lexical
-  // search really does still work.
-  let embeddings: number[][] | null = null
-  let embedError: unknown = null
-  if (config.embeddingsApiKey) {
+  const selected = knowledgeEmbeddingConfig(config)
+  let vectors: number[][] | null = null
+  let embeddingError: unknown
+  if (selected && chunks.length) {
     try {
-      embeddings = await embedTexts(config.embeddingsApiKey, chunks)
-    } catch (err) {
-      embedError = err
+      vectors = validateVectors(
+        await embedTexts(selected, chunks),
+        chunks.length,
+        selected.provider === 'ollama' ? 1024 : 1536,
+      )
+    } catch (error) {
+      embeddingError = error
     }
   }
-
-  const rows = chunks.map((content, i) => ({
-    document_id: documentId,
-    account_id: accountId,
-    chunk_index: i,
-    content,
-    embedding: embeddings ? toVectorLiteral(embeddings[i]) : null,
+  const rows = chunks.map((text, index) => ({
+    content: text,
+    embedding:
+      vectors && selected?.provider === 'openai'
+        ? toVectorLiteral(vectors[index])
+        : null,
+    local_embedding:
+      vectors && selected?.provider === 'ollama'
+        ? toVectorLiteral(vectors[index])
+        : null,
+    local_embedding_space:
+      vectors && selected?.provider === 'ollama' ? selected.space : null,
   }))
-
-  const { error: insErr } = await db.from('ai_knowledge_chunks').insert(rows)
-  if (insErr) throw insErr
-
-  if (embedError) throw embedError
+  // One transaction with ownership and document-version checks inside SQL.
+  const { error: writeError } = await db.rpc('replace_ai_knowledge_chunks', {
+    p_account_id: accountId,
+    p_document_id: documentId,
+    p_content: content,
+    p_chunks: rows,
+  })
+  if (writeError)
+    throw new AiError('Knowledge indexing could not be saved. Please retry.', {
+      code: 'indexing_failed',
+    })
+  // On embedding failure, current lexical chunks have still been saved atomically.
+  if (embeddingError) throw embeddingError
 }
 
-/**
- * Retrieve up to `k` knowledge excerpts relevant to `queryText`.
- *
- * Semantic-primary when an embeddings key is configured (embed the
- * query → cosine-nearest chunks), then topped up with lexical full-text
- * matches to fill `k`. Lexical-only when there's no key. Best-effort:
- * any failure (no KB, embedding error, RPC error) degrades to fewer or
- * zero results and never throws into the draft / auto-reply path.
- */
+/** Account-filtered retrieval with provenance; no globally retrieved rows. */
 export async function retrieveKnowledge(
-  db: SupabaseClient,
-  accountId: string,
-  config: Pick<AiConfig, 'embeddingsApiKey'>,
+  context: AiExecutionContext,
+  config: KnowledgeConfig,
   queryText: string,
   k = 5,
-): Promise<string[]> {
-  const query = queryText.trim()
+): Promise<KnowledgeSource[]> {
+  assertAiContext(context)
+  const { db, accountId } = context
+  const query = queryText.trim().slice(0, 1600)
   if (!query || k <= 0) return []
-
-  // Skip everything when the account has no knowledge base — otherwise
-  // every draft / auto-reply would pay for a query embedding + two RPCs
-  // just to get []. One cheap indexed COUNT (head, no rows) instead of a
-  // paid embeddings call on the hot path.
+  const threshold = Number(process.env.AI_KNOWLEDGE_MIN_SIMILARITY ?? 0.65)
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new AiError('Knowledge relevance threshold is invalid.', {
+      code: 'invalid_config',
+      status: 503,
+    })
+  }
+  const selected = knowledgeEmbeddingConfig(config)
+  let vector: string | null = null
+  let space: string | null = null
   try {
     const { count, error } = await db
       .from('ai_knowledge_chunks')
       .select('id', { count: 'exact', head: true })
       .eq('account_id', accountId)
     if (error || !count) return []
+    if (selected) {
+      try {
+        const embeddings = validateVectors(
+          await embedTexts(selected, [query], 'query'),
+          1,
+          selected.provider === 'ollama' ? 1024 : 1536,
+        )
+        vector = toVectorLiteral(embeddings[0])
+        space =
+          selected.provider === 'ollama'
+            ? selected.space
+            : 'openai:text-embedding-3-small:1536'
+      } catch {
+        console.warn(
+          '[ai knowledge] embeddings unavailable; using tenant lexical retrieval',
+        )
+      }
+    }
+    const { data, error: matchError } = await db.rpc('match_ai_knowledge_v2', {
+      p_account_id: accountId,
+      p_query: query,
+      p_query_embedding: vector,
+      p_embedding_space: space,
+      p_min_similarity: threshold,
+      p_match_count: Math.min(20, Math.floor(k)),
+    })
+    if (matchError || !Array.isArray(data)) return []
+    return data
+      .filter(
+        (row): row is KnowledgeSource =>
+          typeof row.id === 'string' &&
+          typeof row.document_id === 'string' &&
+          typeof row.title === 'string' &&
+          typeof row.content === 'string' &&
+          Number.isFinite(row.score) &&
+          row.content.length > 0 &&
+          ((row.method === 'semantic' && row.score >= threshold) ||
+            (row.method === 'lexical' && row.score > 0)),
+      )
+      .slice(0, k)
   } catch {
     return []
   }
-
-  const picked = new Map<string, string>() // id → content, preserves order
-
-  // Semantic path.
-  if (config.embeddingsApiKey) {
-    try {
-      const [queryEmbedding] = await embedTexts(config.embeddingsApiKey, [query])
-      if (queryEmbedding) {
-        const { data, error } = await db.rpc('match_ai_knowledge_semantic', {
-          p_account_id: accountId,
-          p_query_embedding: toVectorLiteral(queryEmbedding),
-          p_match_count: k,
-        })
-        if (!error && Array.isArray(data)) {
-          for (const row of data as MatchRow[]) picked.set(row.id, row.content)
-        }
-      }
-    } catch (err) {
-      console.error('[ai knowledge] semantic retrieval failed, falling back to FTS:', err)
-    }
-  }
-
-  // Lexical top-up (also the sole path when there's no embeddings key).
-  if (picked.size < k) {
-    try {
-      const { data, error } = await db.rpc('match_ai_knowledge_fts', {
-        p_account_id: accountId,
-        p_query: query,
-        p_match_count: k,
-      })
-      if (!error && Array.isArray(data)) {
-        for (const row of data as MatchRow[]) {
-          if (picked.size >= k) break
-          if (!picked.has(row.id)) picked.set(row.id, row.content)
-        }
-      }
-    } catch (err) {
-      console.error('[ai knowledge] lexical retrieval failed:', err)
-    }
-  }
-
-  return Array.from(picked.values()).slice(0, k)
 }

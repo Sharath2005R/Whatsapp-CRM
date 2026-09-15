@@ -16,6 +16,11 @@ export interface MetaSendResult {
   messageId: string
 }
 
+/** A definite HTTP rejection, distinct from an uncertain timeout/5xx outcome. */
+export class MetaSendRejected extends Error {
+  constructor() { super('Meta rejected the follow-up request.'); this.name = 'MetaSendRejected' }
+}
+
 export interface MetaPhoneInfo {
   id: string
   display_phone_number: string
@@ -216,6 +221,9 @@ export async function getSubscribedApps(
 // ============================================================
 
 export interface SendTextMessageArgs {
+  /** Server-only correlation for durable follow-up reconciliation. */
+  followupCallback?: string
+  signal?: AbortSignal
   phoneNumberId: string
   accessToken: string
   to: string
@@ -244,6 +252,7 @@ export async function sendTextMessage(
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }
   }
+  if (args.followupCallback) body.biz_opaque_callback_data = args.followupCallback
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -251,11 +260,15 @@ export async function sendTextMessage(
       Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify(body),
+    signal: args.signal,
+    redirect: args.followupCallback ? 'error' : undefined,
   })
   if (!response.ok) {
+    if (args.followupCallback && response.status >= 400 && response.status < 500 && response.status !== 408) throw new MetaSendRejected()
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  if (args.followupCallback && (typeof data?.messages?.[0]?.id !== 'string' || !data.messages[0].id || data.messages[0].id.length > 512)) throw new Error('Uncertain Meta outcome')
   return { messageId: data.messages[0].id }
 }
 
@@ -332,6 +345,8 @@ import {
 } from './template-send-builder'
 
 export interface SendTemplateMessageArgs {
+  followupCallback?: string
+  signal?: AbortSignal
   phoneNumberId: string
   accessToken: string
   to: string
@@ -424,6 +439,7 @@ export async function sendTemplateMessage(
     type: 'template',
     template: templatePayload,
   }
+  if (args.followupCallback) body.biz_opaque_callback_data = args.followupCallback
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }
   }
@@ -435,12 +451,35 @@ export async function sendTemplateMessage(
       Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify(body),
+    signal: args.signal,
+    redirect: args.followupCallback ? 'error' : undefined,
   })
   if (!response.ok) {
+    if (args.followupCallback && response.status >= 400 && response.status < 500 && response.status !== 408) throw new MetaSendRejected()
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   const data = await response.json()
+  if (args.followupCallback && (typeof data?.messages?.[0]?.id !== 'string' || !data.messages[0].id || data.messages[0].id.length > 512)) throw new Error('Uncertain Meta outcome')
   return { messageId: data.messages[0].id }
+}
+
+/** Read-only, fail-closed verification in the configured sender's WABA. */
+export async function verifyUtilityTemplate(args: { template: MessageTemplate; accessToken: string; wabaId: string }): Promise<void> {
+  if (!/^\d+$/.test(args.wabaId)) throw new Error('Invalid WABA configuration')
+  const url = new URL(`${META_API_BASE}/${args.wabaId}/message_templates`)
+  url.searchParams.set('name', args.template.name)
+  url.searchParams.set('fields', 'id,name,status,category,language,components')
+  url.searchParams.set('limit', '100')
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${args.accessToken}` },
+    signal: AbortSignal.timeout(10000), redirect: 'error', cache: 'no-store' })
+  if (!response.ok) throw new Error('Template approval could not be verified')
+  const data = await response.json()
+  const match = Array.isArray(data?.data) ? data.data.find((t: { id?: string }) => t.id === args.template.meta_template_id) : null
+  if (!match || match.status !== 'APPROVED' || match.category !== 'UTILITY' || match.name !== args.template.name ||
+    match.language !== args.template.language || !Array.isArray(match.components) ||
+    match.components.find((c: { type?: string }) => c.type === 'BODY')?.text !== args.template.body_text ||
+    match.components.some((c: { type?: string }) => !['BODY', 'FOOTER'].includes(c.type ?? '')))
+    throw new Error('Template approval could not be verified')
 }
 
 // ============================================================
